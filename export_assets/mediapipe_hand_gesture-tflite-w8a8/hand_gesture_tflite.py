@@ -5,18 +5,36 @@ import numpy as np
 import torch
 from PIL import Image
 import time
+import os
+import traceback
 
 from ai_edge_litert.interpreter import Interpreter, load_delegate
 from qai_hub_models.models.mediapipe_hand_gesture.app import MediaPipeHandGestureApp
 
-
 def build_delegates(use_qnn: bool):
     if not use_qnn:
         return []
+
+    delegate_path = os.environ.get("QNN_TFLITE_DELEGATE", "libQnnTFLiteDelegate.so")
+    print(f"Trying QNN delegate: {delegate_path}")
+
     try:
-        return [load_delegate("libQnnTFLiteDelegate.so", options={"backend_type": "htp"})]
-    except Exception:
-        return []
+        d = load_delegate(
+            delegate_path,
+            options={
+                "backend_type": "htp",
+                # Try these only after basic load works:
+                # "htp_device_id": "0",
+                # "htp_performance_mode": "2",
+                # "htp_precision": "1",
+            },
+        )
+        print("QNN delegate loaded successfully")
+        return [d]
+    except Exception as e:
+        print("QNN delegate load failed:")
+        traceback.print_exc()
+        raise
 
 
 def quantize_array(arr: np.ndarray, detail: dict) -> np.ndarray:
@@ -77,7 +95,7 @@ class PalmDetectorTFLite:
         )
 
         t2 = time.time()
-        print(t2-t1)
+        print(f"PalmDetector: {(t2 - t1) * 1000:.2f} ms")
 
         return torch.from_numpy(box_coords).float(), torch.from_numpy(box_scores).float()
 
@@ -117,7 +135,7 @@ class HandLandmarkDetectorTFLite:
         )
 
         t2 = time.time()
-        print(t2-t1)
+        print(f"HandLandmarkDetector: {(t2 - t1) * 1000:.2f} ms")
 
         return (
             torch.from_numpy(landmarks).float(),
@@ -156,7 +174,7 @@ class CannedGestureClassifierTFLite:
         )
 
         t2 = time.time()
-        print(t2-t1)
+        print(f"CannedGestureClassifier: {(t2 - t1) * 1000:.2f} ms")
 
         return torch.from_numpy(out).float()
 
@@ -196,6 +214,7 @@ def main():
     img = Image.open(args.image).convert("RGB")
     img_np = np.array(img)
 
+    t0 = time.perf_counter()
     raw = app.predict_landmarks_from_image(img_np, raw_output=True)
     (
         _batched_boxes,
@@ -205,6 +224,8 @@ def main():
         batched_is_right,
         batched_gestures,
     ) = raw
+    t1 = time.perf_counter()
+    print(f"Total pipeline: {(t1 - t0) * 1000:.2f} ms")
 
     gestures = batched_gestures[0] if len(batched_gestures) > 0 else []
     hands = batched_is_right[0] if len(batched_is_right) > 0 else []
