@@ -1,0 +1,81 @@
+runtime: tflite
+precision: w8a8
+tool_versions:
+  qairt: 2.43.0.260127150333_193827
+  tflite: 2.17.0
+model_files:
+  PalmDetector.tflite:
+    inputs:
+      image:
+        shape: [1, 256, 256, 3]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.003921568859368563
+          zero_point: 0
+    outputs:
+      box_coords:
+        shape: [1, 2944, 18]
+        dtype: uint8
+        quantization_parameters:
+          scale: 1.5904415845870972
+          zero_point: 51
+      box_scores:
+        shape: [1, 2944]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.00390625
+          zero_point: 0
+  HandLandmarkDetector.tflite:
+    inputs:
+      image:
+        shape: [1, 224, 224, 3]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.003921568859368563
+          zero_point: 0
+    outputs:
+      landmarks:
+        shape: [1, 63]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.9720752239227295
+          zero_point: 33
+      scores:
+        shape: [1, 1]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.00390625
+          zero_point: 0
+      lr:
+        shape: [1, 1]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.00390625
+          zero_point: 0
+      world_landmarks:
+        shape: [1, 63]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.0008771540015004575
+          zero_point: 124
+  CannedGestureClassifier.tflite:
+    inputs:
+      hand:
+        shape: [1, 64]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.0069572897627949715
+          zero_point: 111
+      mirrored_hand:
+        shape: [1, 64]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.0069572897627949715
+          zero_point: 111
+    outputs:
+      Identity:
+        shape: [1, 8]
+        dtype: uint8
+        quantization_parameters:
+          scale: 0.00390625
+          zero_point: 0
