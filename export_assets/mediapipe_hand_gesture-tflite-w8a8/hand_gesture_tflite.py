@@ -6,6 +6,7 @@ import torch
 from PIL import Image
 import time
 import os
+import sys
 import traceback
 
 from ai_edge_litert.interpreter import Interpreter, load_delegate
@@ -192,7 +193,7 @@ def main():
 
     palm_detector = PalmDetectorTFLite(palm_path, use_qnn=args.use_qnn)
     landmark_detector = HandLandmarkDetectorTFLite(landmark_path, use_qnn=args.use_qnn)
-    gesture_classifier = CannedGestureClassifierTFLite(gesture_path, use_qnn=args.use_qnn)
+    gesture_classifier = CannedGestureClassifierTFLite(gesture_path, use_qnn=False)
 
     anchors = torch.empty(0)
     palm_input_spec = {"image": ((1, 3, 256, 256), "float32")}
@@ -236,6 +237,9 @@ def main():
         for i, (g, right) in enumerate(zip(gestures, hands, strict=False), start=1):
             handedness = "Right" if right else "Left"
             print(f"Hand {i}: {handedness} - {g}")
+
+    sys.stdout.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
