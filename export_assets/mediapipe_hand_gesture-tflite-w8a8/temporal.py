@@ -182,7 +182,8 @@ def main():
         nms_iou_threshold=0.3,
         min_landmark_score=0.2,
     )
-
+    
+    # Begin video capture
     cap = cv2.VideoCapture(args.camera)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -197,8 +198,10 @@ def main():
     candidate_label = None
     candidate_count = 0
 
-    confirm_frames = 3
-    clear_frames = 5
+    # Adjust for more stable predictions
+    # Default: confirm_frames = 3, clear_frames = 5
+    confirm_frames = 4
+    clear_frames = 6
 
     fps = 0.0
     prev_time = time.perf_counter()
