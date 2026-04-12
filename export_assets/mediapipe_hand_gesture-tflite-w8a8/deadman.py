@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 import time
@@ -6,6 +7,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import requests
 import torch
 
 from ai_edge_litert.interpreter import Interpreter, load_delegate
@@ -149,10 +151,86 @@ class CannedGestureClassifierTFLite:
         return torch.from_numpy(out).float()
 
 
+class RoverController:
+    def __init__(self, rover_ip: str, refresh_interval: float = 0.25):
+        self.base_url = f"http://{rover_ip}/js?json="
+        self.refresh_interval = refresh_interval
+        self.last_sent = (None, None)
+        self.last_send_time = 0.0
+        self.last_error_time = 0.0
+
+    def send_speed(self, left: float, right: float, force: bool = False):
+        left = round(float(left), 3)
+        right = round(float(right), 3)
+        now = time.perf_counter()
+
+        same_cmd = (left, right) == self.last_sent
+        sent_recently = (now - self.last_send_time) < self.refresh_interval
+
+        if not force and same_cmd and sent_recently:
+            return
+
+        cmd = {"T": 1, "L": left, "R": right}
+        url = self.base_url + json.dumps(cmd, separators=(",", ":"))
+
+        try:
+            requests.get(url, timeout=0.25)
+        except requests.RequestException as e:
+            if now - self.last_error_time > 2.0:
+                print(f"Rover send failed: {e}")
+                self.last_error_time = now
+
+        self.last_sent = (left, right)
+        self.last_send_time = now
+
+
+def classify_control(gestures, hands):
+    """
+    Returns:
+        control_token: one of
+            FORWARD, REVERSE, TURN_LEFT, TURN_RIGHT, STOP, UNKNOWN, AMBIGUOUS, None
+        display_text: string for overlay
+    """
+    requested = set()
+    display_labels = []
+
+    for i, g in enumerate(gestures):
+        if not g or g == "None":
+            continue
+
+        is_right = bool(hands[i]) if i < len(hands) else False
+        hand_name = "Right" if is_right else "Left"
+        display_labels.append(f"{hand_name}: {g}")
+
+        if g == "Closed_Fist":
+            requested.add("STOP")
+        elif g == "Thumb_Up":
+            requested.add("FORWARD")
+        elif g == "Thumb_Down":
+            requested.add("REVERSE")
+        elif g == "Open_Palm":
+            requested.add("TURN_RIGHT" if is_right else "TURN_LEFT")
+        else:
+            requested.add("UNKNOWN")
+
+    if not display_labels:
+        return None, "No hand detected"
+
+    if "STOP" in requested:
+        return "STOP", ", ".join(display_labels)
+
+    if len(requested) > 1:
+        return "AMBIGUOUS", ", ".join(display_labels)
+
+    token = next(iter(requested))
+    return token, ", ".join(display_labels)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--use-qnn", action="store_true")
+    parser.add_argument("--rover-ip", type=str, default="192.168.4.1")
     args = parser.parse_args()
 
     base = Path(".")
@@ -163,7 +241,7 @@ def main():
     palm_detector = PalmDetectorTFLite(palm_path, use_qnn=args.use_qnn)
     landmark_detector = HandLandmarkDetectorTFLite(landmark_path, use_qnn=args.use_qnn)
 
-    # Keep gesture classifier on CPU for stability.
+    # Keep gesture classifier on CPU for stability
     gesture_classifier = CannedGestureClassifierTFLite(gesture_path, use_qnn=False)
 
     anchors = torch.empty(0)
@@ -183,6 +261,25 @@ def main():
         min_landmark_score=0.2,
     )
 
+    rover = RoverController(args.rover_ip)
+
+    # Conservative speeds for first testing
+    forward_speed = 0.18
+    reverse_speed = 0.12
+    turn_speed = 0.16
+
+    # Gesture smoothing
+    candidate_control = None
+    candidate_text = "No hand detected"
+    candidate_count = 0
+
+    stable_control = None
+    stable_text = "No hand detected"
+
+    confirm_frames = 4
+    clear_frames = 6
+
+    # Begin video capture
     cap = cv2.VideoCapture(args.camera)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -191,9 +288,11 @@ def main():
         print("Could not open camera")
         sys.exit(1)
 
+    # Start stopped
+    rover.send_speed(0.0, 0.0, force=True)
+
     print("Press q to quit.")
 
-    last_label = "Starting..."
     fps = 0.0
     prev_time = time.perf_counter()
 
@@ -221,28 +320,78 @@ def main():
             gestures = batched_gestures[0] if len(batched_gestures) > 0 else []
             hands = batched_is_right[0] if len(batched_is_right) > 0 else []
 
-            if gestures:
-                g = gestures[0]
-                right = hands[0] if len(hands) > 0 else False
-                handedness = "Right" if right else "Left"
-                last_label = f"{handedness}: {g}"
+            observed_control, observed_text = classify_control(gestures, hands)
+
+            # Smoothing
+            if observed_control == candidate_control:
+                candidate_count += 1
             else:
-                last_label = "No hand detected"
+                candidate_control = observed_control
+                candidate_text = observed_text
+                candidate_count = 1
+
+            if candidate_control is None:
+                if candidate_count >= clear_frames:
+                    stable_control = None
+                    stable_text = "No hand detected"
+            else:
+                if candidate_count >= confirm_frames:
+                    stable_control = candidate_control
+                    stable_text = candidate_text
+
+            # Map stable control -> rover command
+            if stable_control == "FORWARD":
+                left_speed = forward_speed
+                right_speed = forward_speed
+                rover_state = "FORWARD"
+
+            elif stable_control == "REVERSE":
+                left_speed = -reverse_speed
+                right_speed = -reverse_speed
+                rover_state = "REVERSE"
+
+            elif stable_control == "TURN_LEFT":
+                left_speed = -turn_speed
+                right_speed = turn_speed
+                rover_state = "TURN LEFT"
+
+            elif stable_control == "TURN_RIGHT":
+                left_speed = turn_speed
+                right_speed = -turn_speed
+                rover_state = "TURN RIGHT"
+
+            elif stable_control == "AMBIGUOUS":
+                left_speed = 0.0
+                right_speed = 0.0
+                rover_state = "STOP (AMBIGUOUS)"
+
+            elif stable_control == "UNKNOWN":
+                left_speed = 0.0
+                right_speed = 0.0
+                rover_state = "STOP (UNKNOWN GESTURE)"
+
+            else:
+                left_speed = 0.0
+                right_speed = 0.0
+                rover_state = "STOPPED"
+
+            rover.send_speed(left_speed, right_speed)
 
             now = time.perf_counter()
             dt = now - prev_time
             prev_time = now
             if dt > 0:
-                fps = 1.0 / dt
+                inst_fps = 1.0 / dt
+                fps = inst_fps if fps == 0.0 else (0.9 * fps + 0.1 * inst_fps)
 
             latency_ms = (t1 - t0) * 1000.0
 
             cv2.putText(
                 frame_bgr,
-                last_label,
-                (20, 40),
+                f"Gesture: {stable_text}",
+                (20, 35),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
+                0.65,
                 (0, 255, 0),
                 2,
                 cv2.LINE_AA,
@@ -250,10 +399,32 @@ def main():
 
             cv2.putText(
                 frame_bgr,
-                f"Latency: {latency_ms:.1f} ms",
-                (20, 80),
+                f"State: {rover_state}",
+                (20, 70),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
+                0.65,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+            cv2.putText(
+                frame_bgr,
+                f"Cmd L/R: {left_speed:.2f}, {right_speed:.2f}",
+                (20, 105),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 220, 0),
+                2,
+                cv2.LINE_AA,
+            )
+
+            cv2.putText(
+                frame_bgr,
+                f"Latency: {latency_ms:.1f} ms",
+                (20, 140),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
                 (0, 255, 255),
                 2,
                 cv2.LINE_AA,
@@ -262,9 +433,9 @@ def main():
             cv2.putText(
                 frame_bgr,
                 f"FPS: {fps:.1f}",
-                (20, 115),
+                (20, 175),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
+                0.65,
                 (255, 255, 0),
                 2,
                 cv2.LINE_AA,
@@ -276,6 +447,12 @@ def main():
                 break
 
     finally:
+        try:
+            rover.send_speed(0.0, 0.0, force=True)
+            time.sleep(0.1)
+        except Exception:
+            pass
+
         cap.release()
         cv2.destroyAllWindows()
         sys.stdout.flush()
