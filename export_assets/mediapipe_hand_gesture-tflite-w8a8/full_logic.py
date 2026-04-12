@@ -268,8 +268,8 @@ def main():
 
     forward_speed = 0.18
     reverse_speed = 0.12
-    stationary_turn_speed = 0.16
-    moving_turn_inner_scale = 0.35
+    stationary_turn_speed = 0.30
+    moving_turn_inner_scale = 0.10
 
     forward_latched = False
 
