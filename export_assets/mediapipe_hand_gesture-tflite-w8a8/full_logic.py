@@ -187,9 +187,10 @@ class RoverController:
 def classify_control(gestures, hands):
     """
     Returns:
-        control_token: one of
-            FORWARD, REVERSE, TURN_LEFT, TURN_RIGHT, STOP, UNKNOWN, AMBIGUOUS, None
-        display_text: string for overlay
+        control_token:
+            STOP_NOW, LATCH_FORWARD, REVERSE, TURN_LEFT, TURN_RIGHT,
+            UNKNOWN, AMBIGUOUS, None
+        display_text: overlay text
     """
     requested = set()
     display_labels = []
@@ -203,9 +204,9 @@ def classify_control(gestures, hands):
         display_labels.append(f"{hand_name}: {g}")
 
         if g == "Closed_Fist":
-            requested.add("STOP")
+            requested.add("STOP_NOW")
         elif g == "Thumb_Up":
-            requested.add("FORWARD")
+            requested.add("LATCH_FORWARD")
         elif g == "Thumb_Down":
             requested.add("REVERSE")
         elif g == "Open_Palm":
@@ -216,14 +217,18 @@ def classify_control(gestures, hands):
     if not display_labels:
         return None, "No hand detected"
 
-    if "STOP" in requested:
-        return "STOP", ", ".join(display_labels)
+    if "STOP_NOW" in requested:
+        return "STOP_NOW", ", ".join(display_labels)
 
-    if len(requested) > 1:
+    non_unknown = {x for x in requested if x != "UNKNOWN"}
+
+    if len(non_unknown) > 1:
         return "AMBIGUOUS", ", ".join(display_labels)
 
-    token = next(iter(requested))
-    return token, ", ".join(display_labels)
+    if len(non_unknown) == 1:
+        return next(iter(non_unknown)), ", ".join(display_labels)
+
+    return "UNKNOWN", ", ".join(display_labels)
 
 
 def main():
@@ -240,8 +245,6 @@ def main():
 
     palm_detector = PalmDetectorTFLite(palm_path, use_qnn=args.use_qnn)
     landmark_detector = HandLandmarkDetectorTFLite(landmark_path, use_qnn=args.use_qnn)
-
-    # Keep gesture classifier on CPU for stability
     gesture_classifier = CannedGestureClassifierTFLite(gesture_path, use_qnn=False)
 
     anchors = torch.empty(0)
@@ -263,12 +266,13 @@ def main():
 
     rover = RoverController(args.rover_ip)
 
-    # Conservative speeds for first testing
     forward_speed = 0.18
     reverse_speed = 0.12
-    turn_speed = 0.35
+    stationary_turn_speed = 0.16
+    moving_turn_inner_scale = 0.35
 
-    # Gesture smoothing
+    forward_latched = False
+
     candidate_control = None
     candidate_text = "No hand detected"
     candidate_count = 0
@@ -279,7 +283,6 @@ def main():
     confirm_frames = 3
     clear_frames = 2
 
-    # Begin video capture
     cap = cv2.VideoCapture(args.camera)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -288,7 +291,6 @@ def main():
         print("Could not open camera")
         sys.exit(1)
 
-    # Start stopped
     rover.send_speed(0.0, 0.0, force=True)
 
     print("Press q to quit.")
@@ -322,60 +324,80 @@ def main():
 
             observed_control, observed_text = classify_control(gestures, hands)
 
-            # Smoothing
-            if observed_control == candidate_control:
-                candidate_count += 1
-            else:
-                candidate_control = observed_control
-                candidate_text = observed_text
-                candidate_count = 1
-
-            if candidate_control is None:
-                if candidate_count >= clear_frames:
-                    stable_control = None
-                    stable_text = "No hand detected"
-            else:
-                if candidate_count >= confirm_frames:
-                    stable_control = candidate_control
-                    stable_text = candidate_text
-
-            # Map stable control -> rover command
-            if stable_control == "FORWARD":
-                left_speed = forward_speed
-                right_speed = forward_speed
-                rover_state = "FORWARD"
-
-            elif stable_control == "REVERSE":
-                left_speed = -reverse_speed
-                right_speed = -reverse_speed
-                rover_state = "REVERSE"
-
-            elif stable_control == "TURN_LEFT":
-                left_speed = -turn_speed
-                right_speed = turn_speed
-                rover_state = "TURN LEFT"
-
-            elif stable_control == "TURN_RIGHT":
-                left_speed = turn_speed
-                right_speed = -turn_speed
-                rover_state = "TURN RIGHT"
-
-            elif stable_control == "AMBIGUOUS":
+            if observed_control == "STOP_NOW":
+                forward_latched = False
+                stable_control = "STOP_NOW"
+                stable_text = observed_text
                 left_speed = 0.0
                 right_speed = 0.0
-                rover_state = "STOP (AMBIGUOUS)"
-
-            elif stable_control == "UNKNOWN":
-                left_speed = 0.0
-                right_speed = 0.0
-                rover_state = "STOP (UNKNOWN GESTURE)"
-
+                rover_state = "STOPPED (FIST)"
+                rover.send_speed(left_speed, right_speed, force=True)
             else:
-                left_speed = 0.0
-                right_speed = 0.0
-                rover_state = "STOPPED"
+                if observed_control == candidate_control:
+                    candidate_count += 1
+                else:
+                    candidate_control = observed_control
+                    candidate_text = observed_text
+                    candidate_count = 1
 
-            rover.send_speed(left_speed, right_speed)
+                if candidate_control is None:
+                    if candidate_count >= clear_frames:
+                        stable_control = None
+                        stable_text = "No hand detected"
+                else:
+                    if candidate_count >= confirm_frames:
+                        stable_control = candidate_control
+                        stable_text = candidate_text
+
+                if stable_control == "LATCH_FORWARD":
+                    forward_latched = True
+
+                if stable_control == "TURN_LEFT":
+                    if forward_latched:
+                        left_speed = forward_speed * moving_turn_inner_scale
+                        right_speed = forward_speed
+                        rover_state = "TURN LEFT (MOVING)"
+                    else:
+                        left_speed = -stationary_turn_speed
+                        right_speed = stationary_turn_speed
+                        rover_state = "TURN LEFT (STATIONARY)"
+
+                elif stable_control == "TURN_RIGHT":
+                    if forward_latched:
+                        left_speed = forward_speed
+                        right_speed = forward_speed * moving_turn_inner_scale
+                        rover_state = "TURN RIGHT (MOVING)"
+                    else:
+                        left_speed = stationary_turn_speed
+                        right_speed = -stationary_turn_speed
+                        rover_state = "TURN RIGHT (STATIONARY)"
+
+                elif stable_control == "REVERSE":
+                    left_speed = -reverse_speed
+                    right_speed = -reverse_speed
+                    rover_state = "REVERSE"
+
+                elif stable_control == "AMBIGUOUS":
+                    left_speed = 0.0
+                    right_speed = 0.0
+                    rover_state = "STOP (AMBIGUOUS)"
+
+                elif stable_control == "UNKNOWN":
+                    left_speed = 0.0
+                    right_speed = 0.0
+                    rover_state = "STOP (UNKNOWN)"
+
+                else:
+                    if forward_latched:
+                        left_speed = forward_speed
+                        right_speed = forward_speed
+                        rover_state = "FORWARD (LATCHED)"
+                    else:
+                        left_speed = 0.0
+                        right_speed = 0.0
+                        rover_state = "STOPPED"
+
+                rover.send_speed(left_speed, right_speed)
 
             now = time.perf_counter()
             dt = now - prev_time
@@ -410,7 +432,7 @@ def main():
 
             cv2.putText(
                 frame_bgr,
-                f"Cmd L/R: {left_speed:.2f}, {right_speed:.2f}",
+                f"Forward latch: {'ON' if forward_latched else 'OFF'}",
                 (20, 105),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
@@ -421,8 +443,19 @@ def main():
 
             cv2.putText(
                 frame_bgr,
-                f"Latency: {latency_ms:.1f} ms",
+                f"Cmd L/R: {left_speed:.2f}, {right_speed:.2f}",
                 (20, 140),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (200, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+            cv2.putText(
+                frame_bgr,
+                f"Latency: {latency_ms:.1f} ms",
+                (20, 175),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
                 (0, 255, 255),
@@ -433,7 +466,7 @@ def main():
             cv2.putText(
                 frame_bgr,
                 f"FPS: {fps:.1f}",
-                (20, 175),
+                (20, 210),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
                 (255, 255, 0),
